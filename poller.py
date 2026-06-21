@@ -3,21 +3,19 @@
 Chains - live tournament poller (Railway always-on service).
 
 Polls the PDGA live feed every ~25 seconds and writes scores to Firebase.
-The current round goes to /live; every real round is also archived to
-/rounds/{eventId}-r{N} so the app's round tabs can show R1/R2/R3/Finals even
-after they finish. The app reads these in real time.
+- Current round -> /live  (with clean rounds_list + event_final flag).
+- Every real round -> /rounds/{eventId}-r{N}  (so the app's round tabs work).
+- Every COMPLETED past event is backfilled once into /rounds + /rounds_index
+  (so the app can look back at any tournament, round by round).
 
 The current event is chosen AUTOMATICALLY from the season schedule
-(data/season.json in chains-dgpt-data): whichever event is live today by date,
-else the next upcoming one. EVENT_ID env var is only a fallback if the schedule
-can't be loaded, so the live feed never breaks.
+(data/season.json in chains-dgpt-data) by start_date/end_date.
 
-ROUND NUMBERING NOTE (important): PDGA does NOT number rounds 1..N. A Major can
-report qualifying rounds 1,2,3 and then number the Finals "12" and a Playoff
-"13". So "latest_round" can be 12 even though there are only 3+Finals rounds.
-To keep the app sane we publish a clean `rounds_list` (the real rounds, in order,
-with human labels like "Finals") plus `current_round_label`. The app should build
-its round tabs from `rounds_list` and NEVER display the raw PDGA number.
+ROUND NUMBERING NOTE: PDGA does NOT number rounds 1..N. A Major reports
+qualifying rounds 1,2,3 and then numbers the Finals "12" and a Playoff "13".
+So round numbers are unreliable for "is it over." We publish a clean
+rounds_list (real rounds + human labels) and decide an event is FINAL from the
+schedule end_date + every player completed - never from a round number.
 """
 import json, os, time, urllib.request
 from datetime import datetime, timezone
@@ -46,45 +44,52 @@ def put_firebase(path, data):
                                  headers={"Content-Type": "application/json"})
     urllib.request.urlopen(req, timeout=30).read()
 
-def current_event_id():
-    """Event live today (or next upcoming) from season.json; EVENT_ID env is the fallback."""
+def get_firebase(path):
+    """Read a Firebase path; None on miss/err (used for idempotent backfill checks)."""
     try:
-        sched = json.loads(get(SEASON_URL))
-        events = [e for e in sched.get("events", []) if e.get("start") and e.get("end")]
+        raw = get(f"{FIREBASE_BASE}/{path}.json")
+        return json.loads(raw)
+    except Exception:
+        return None
+
+def _sd(e): return e.get("start_date") or e.get("start")
+def _ed(e): return e.get("end_date") or e.get("end")
+
+def load_events():
+    sched = json.loads(get(SEASON_URL))
+    return [e for e in sched.get("events", []) if _sd(e)]
+
+def current_event():
+    """Return the event RECORD live today (or next upcoming) from season.json."""
+    try:
+        events = load_events()
         today = datetime.now(timezone.utc).date().isoformat()
-        live = [e for e in events if e["start"] <= today <= e["end"]]
+        live = [e for e in events if _sd(e) <= today <= (_ed(e) or _sd(e))]
         if live:
-            return str(live[0]["event_id"])
-        upcoming = sorted((e for e in events if e["start"] > today), key=lambda e: e["start"])
+            return live[0]
+        upcoming = sorted((e for e in events if _sd(e) > today), key=_sd)
         if upcoming:
-            return str(upcoming[0]["event_id"])
+            return upcoming[0]
         if events:
-            return str(sorted(events, key=lambda e: e["end"])[-1]["event_id"])
+            return sorted(events, key=lambda e: _ed(e) or _sd(e))[-1]
     except Exception as e:
         print(f"[schedule] could not load season.json ({e}); using EVENT_ID fallback")
-    return EVENT_ID_FALLBACK
+    return {"event_id": EVENT_ID_FALLBACK}
 
 def round_label(meta, n):
-    """Human label for a PDGA round number, e.g. 'Round 1' or 'Finals'."""
     info = (meta.get("RoundsList", {}) or {}).get(str(n), {}) or {}
     return info.get("Label", f"Round {n}")
 
 def build_rounds_list(meta, event_id, latest):
-    """
-    Translate PDGA's RoundsList into the clean, ordered list the app uses for tabs.
-    Includes only rounds that have actually been reached (n <= latest), so an
-    unplayed 'Playoff' doesn't show up as an empty tab before it happens.
-    Each item: {n, label, abbr, key} where key is the /rounds archive key.
-    """
+    """Real rounds only (n <= latest), in order, with labels + archive keys."""
     rl = meta.get("RoundsList", {}) or {}
     try:
         nums = sorted(int(k) for k in rl.keys())
     except Exception:
-        # Fallback: assume 1..Rounds if RoundsList is missing/odd.
         nums = list(range(1, int(meta.get("Rounds", 3)) + 1))
     out = []
     for n in nums:
-        if n > latest:           # not reached yet -> no tab
+        if n > latest:
             continue
         info = rl.get(str(n), {}) or {}
         out.append({
@@ -93,10 +98,14 @@ def build_rounds_list(meta, event_id, latest):
             "abbr": info.get("LabelAbbreviated", str(n)),
             "key": f"{event_id}-r{n}",
         })
-    if not out:                  # safety: always expose at least the current round
+    if not out:
         out = [{"n": latest, "label": round_label(meta, latest),
                 "abbr": str(latest), "key": f"{event_id}-r{latest}"}]
     return out
+
+def fetch_event_meta(event_id):
+    ev = json.loads(get(f"{LIVE_API}/live_results_fetch_event?TournID={event_id}&Division=MPO"))
+    return ev.get("data", {})
 
 def fetch_round(event_id, round_num, meta):
     rd = json.loads(get(f"{LIVE_API}/live_results_fetch_round?TournID={event_id}&Division=MPO&Round={round_num}"))
@@ -131,36 +140,79 @@ def fetch_round(event_id, round_num, meta):
         "holes": holes, "player_count": len(players), "players": players,
     }
 
-def fetch_event_meta(event_id):
-    ev = json.loads(get(f"{LIVE_API}/live_results_fetch_event?TournID={event_id}&Division=MPO"))
-    return ev.get("data", {})
+def is_final(end_date, today, latest, highest_completed, players):
+    """Truly-final signal: end_date reached AND no one still on the course AND the
+    latest round is fully complete. Never trusts a round number alone."""
+    if not end_date or today < end_date:
+        return False
+    if not players:
+        return False
+    if any(p.get("status") == "I" for p in players):
+        return False
+    return highest_completed >= latest
+
+def backfill_completed_events(today):
+    """One-time, idempotent: archive every past event's rounds + write a rounds_index
+    so the app can review any finished tournament. Skips events already archived."""
+    try:
+        events = load_events()
+    except Exception as e:
+        print(f"[backfill] could not load schedule: {e}")
+        return
+    for rec in events:
+        end = _ed(rec)
+        if not end or end >= today:        # only fully-finished events
+            continue
+        eid = str(rec["event_id"])
+        if get_firebase(f"rounds_index/{eid}"):   # already done
+            continue
+        try:
+            meta = fetch_event_meta(eid)
+            latest = meta.get("LatestRound", 1)
+            rl = build_rounds_list(meta, eid, latest)
+            for r in rl:
+                put_firebase(f"rounds/{eid}-r{r['n']}", fetch_round(eid, r["n"], meta))
+            put_firebase(f"rounds_index/{eid}", {
+                "event_id": eid, "event_name": meta.get("Name", ""),
+                "rounds_list": rl, "rounds": meta.get("Rounds", 3),
+                "event_final": True,
+                "finalized_at": datetime.now(timezone.utc).isoformat(),
+            })
+            print(f"[backfill] archived event {eid} ({len(rl)} rounds)")
+        except Exception as e:
+            print(f"[backfill] event {eid} failed: {e}")
 
 def main():
     print(f"Chains poller starting. Schedule-driven, every {POLL_SECONDS}s -> {FIREBASE_BASE}/live (+ /rounds archive)")
     consecutive_errors = 0
     archived = set()
+    did_backfill = False
     while True:
         try:
-            event_id = current_event_id()
+            today = datetime.now(timezone.utc).date().isoformat()
+            rec = current_event()
+            event_id = str(rec["event_id"])
             meta = fetch_event_meta(event_id)
             latest = meta.get("LatestRound", 1)
             rounds_list = build_rounds_list(meta, event_id, latest)
 
             live = fetch_round(event_id, latest, meta)
-            # Clean round metadata for the app (so it never shows raw "12").
-            live["rounds_list"] = rounds_list                # [{n,label,abbr,key}, ...]
-            live["current_round"] = latest                   # raw PDGA number (12 = Finals)
-            live["current_round_label"] = round_label(meta, latest)   # "Finals"
-            live["round_count"] = len(rounds_list)           # e.g. 4 (R1,R2,R3,Finals)
+            live["rounds_list"] = rounds_list
+            live["current_round"] = latest
+            live["current_round_label"] = round_label(meta, latest)
+            live["round_count"] = len(rounds_list)
             live["round_index"] = next((i + 1 for i, r in enumerate(rounds_list)
-                                        if r["n"] == latest), len(rounds_list))  # "4 of 4"
+                                        if r["n"] == latest), len(rounds_list))
+            live["event_final"] = is_final(_ed(rec), today, latest,
+                                           live["highest_completed_round"], live["players"])
             put_firebase("live", live)
 
             active = len([p for p in live["players"] if p["status"] == "I"])
+            flag = " [FINAL]" if live["event_final"] else ""
             print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] "
                   f"event {event_id} {live['current_round_label']} "
                   f"({live['round_index']}/{live['round_count']}) "
-                  f"{live['player_count']} players, {active} on course")
+                  f"{live['player_count']} players, {active} on course{flag}")
             consecutive_errors = 0
         except Exception as e:
             consecutive_errors += 1
@@ -170,20 +222,35 @@ def main():
             time.sleep(POLL_SECONDS)
             continue
 
-        # Archive every REAL round so the app's R1/R2/R3/Finals tabs work.
-        # Iterate the real round numbers only (never 4..11, which don't exist).
+        # Archive the live event's rounds (current keeps updating; finished ones once).
         try:
-            put_firebase(f"rounds/{event_id}-r{latest}", live)   # current round, keeps updating
+            put_firebase(f"rounds/{event_id}-r{latest}", live)
             for r in rounds_list:
-                n = r["n"]
-                if n == latest:
+                if r["n"] == latest:
                     continue
                 key = r["key"]
                 if key not in archived:
-                    put_firebase(f"rounds/{key}", fetch_round(event_id, n, meta))
+                    put_firebase(f"rounds/{key}", fetch_round(event_id, r["n"], meta))
                     archived.add(key)
+            if live.get("event_final") and not get_firebase(f"rounds_index/{event_id}"):
+                put_firebase(f"rounds_index/{event_id}", {
+                    "event_id": event_id, "event_name": live.get("event_name", ""),
+                    "rounds_list": rounds_list, "rounds": live.get("rounds", 3),
+                    "event_final": True,
+                    "finalized_at": datetime.now(timezone.utc).isoformat(),
+                })
         except Exception as e:
             print(f"[archive] {e}")
+
+        # One-time backfill of all completed past events (idempotent; after the first
+        # fresh /live write so the live view is never delayed by it).
+        if not did_backfill:
+            try:
+                backfill_completed_events(today)
+            except Exception as e:
+                print(f"[backfill] {e}")
+            did_backfill = True
+
         time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
