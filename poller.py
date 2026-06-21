@@ -151,14 +151,15 @@ def is_final(end_date, today, latest, highest_completed, players):
         return False
     return highest_completed >= latest
 
-def backfill_completed_events(today):
-    """One-time, idempotent: archive every past event's rounds + write a rounds_index
-    so the app can review any finished tournament. Skips events already archived."""
+def backfill_next_completed_event(today):
+    """Archive ONE not-yet-indexed completed event per call, so each poll cycle stays
+    light (never a long blocking sweep). Per-round resumable + resilient: skips rounds
+    already saved and skips a round that errors. Returns True if it touched an event."""
     try:
         events = load_events()
     except Exception as e:
         print(f"[backfill] could not load schedule: {e}")
-        return
+        return False
     for rec in events:
         end = _ed(rec)
         if not end or end >= today:        # only fully-finished events
@@ -171,7 +172,13 @@ def backfill_completed_events(today):
             latest = meta.get("LatestRound", 1)
             rl = build_rounds_list(meta, eid, latest)
             for r in rl:
-                put_firebase(f"rounds/{eid}-r{r['n']}", fetch_round(eid, r["n"], meta))
+                rkey = f"{eid}-r{r['n']}"
+                if get_firebase(f"rounds/{rkey}") is not None:
+                    continue               # resume: already archived
+                try:
+                    put_firebase(f"rounds/{rkey}", fetch_round(eid, r["n"], meta))
+                except Exception as e:
+                    print(f"[backfill] {rkey} skipped: {e}")
             put_firebase(f"rounds_index/{eid}", {
                 "event_id": eid, "event_name": meta.get("Name", ""),
                 "rounds_list": rl, "rounds": meta.get("Rounds", 3),
@@ -181,12 +188,12 @@ def backfill_completed_events(today):
             print(f"[backfill] archived event {eid} ({len(rl)} rounds)")
         except Exception as e:
             print(f"[backfill] event {eid} failed: {e}")
+        return True                        # one event per call -> light cycles
 
 def main():
     print(f"Chains poller starting. Schedule-driven, every {POLL_SECONDS}s -> {FIREBASE_BASE}/live (+ /rounds archive)")
     consecutive_errors = 0
     archived = set()
-    did_backfill = False
     while True:
         try:
             today = datetime.now(timezone.utc).date().isoformat()
@@ -242,14 +249,12 @@ def main():
         except Exception as e:
             print(f"[archive] {e}")
 
-        # One-time backfill of all completed past events (idempotent; after the first
-        # fresh /live write so the live view is never delayed by it).
-        if not did_backfill:
-            try:
-                backfill_completed_events(today)
-            except Exception as e:
-                print(f"[backfill] {e}")
-            did_backfill = True
+        # Gentle backfill: archive at most ONE completed past event per cycle, so the
+        # live view is never blocked by a long sweep (idempotent + resumable).
+        try:
+            backfill_next_completed_event(today)
+        except Exception as e:
+            print(f"[backfill] {e}")
 
         time.sleep(POLL_SECONDS)
 
