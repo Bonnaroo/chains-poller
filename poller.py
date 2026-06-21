@@ -33,12 +33,18 @@ POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "25"))
 LIVE_API = "https://www.pdga.com/apps/tournament/live-api"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
+# Firebase auth: set FB_AUTH on Railway when the database is locked down.
+# Empty (the default) is a no-op, so this is safe to deploy now and activate later.
+FB_AUTH = os.environ.get("FB_AUTH", "")
+def _auth():
+    return f"?auth={FB_AUTH}" if FB_AUTH else ""
+
 def get(url, timeout=30):
     req = urllib.request.Request(url, headers=HEADERS)
     return urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "replace")
 
 def put_firebase(path, data):
-    url = f"{FIREBASE_BASE}/{path}.json"
+    url = f"{FIREBASE_BASE}/{path}.json{_auth()}"
     body = json.dumps(data).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="PUT",
                                  headers={"Content-Type": "application/json"})
@@ -47,7 +53,7 @@ def put_firebase(path, data):
 def get_firebase(path):
     """Read a Firebase path; None on miss/err (used for idempotent backfill checks)."""
     try:
-        raw = get(f"{FIREBASE_BASE}/{path}.json")
+        raw = get(f"{FIREBASE_BASE}/{path}.json{_auth()}")
         return json.loads(raw)
     except Exception:
         return None
