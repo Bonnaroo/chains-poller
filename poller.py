@@ -401,6 +401,8 @@ def score_picks(picks, players, name_map, one_pick):
         r = dict(row) if isinstance(row, dict) else row
         if not isinstance(r, dict):
             out.append(r); continue
+        if r.get("scr"):
+            out.append(r); continue   # scratched row: last place, 1 point, never scored
         if r.get("p1") and r.get("s1") is None:
             r["s1"] = score_for(r["p1"]); changed = True
         if not one_pick and r.get("p2") and r.get("s2") is None:
@@ -431,7 +433,7 @@ def finalize_picks(events=None):
         if not isinstance(picks, list) or not picks:
             continue
         one = bool(settings.get(f"onepick_{t}"))
-        needs = any(isinstance(r, dict) and ((r.get("p1") and r.get("s1") is None) or
+        needs = any(isinstance(r, dict) and not r.get("scr") and ((r.get("p1") and r.get("s1") is None) or
                     (not one and r.get("p2") and r.get("s2") is None)) for r in picks)
         if not needs:
             continue
@@ -456,6 +458,424 @@ def finalize_picks(events=None):
         put_firebase("league/rev", now)
         written += 1
     return written
+
+# ---------------------------------------------------------------------------
+# Draft referee (2026-09-12) — the always-on process owns the draft clock.
+# ---------------------------------------------------------------------------
+# Why: picks used to depend on whoever had the app open. Nothing enforced turn
+# order or time, the pool could include players who weren't playing, and the
+# old in-browser autopick wrote picks nobody made. The referee below runs in
+# this process against one source of truth (Firebase) and the app just shows it.
+#
+# Rules (league decision, Will, 2026-09-12):
+#   - Window: opens start_date - DRAFT_OPEN_DAYS_BEFORE days at 00:00Z (Mon 8pm ET
+#     for a Thursday event) and the hard deadline is start_date 00:00Z minus
+#     DRAFT_DEADLINE_HOURS_BEFORE (Wed 8am ET). Both derive from the schedule, so a
+#     Wednesday event shifts automatically. A draft never opens before the
+#     previous event has ended.
+#   - Snake order: last place in the previous scored event picks first; pick-2
+#     round is reversed. (Same ranking as the app: place, total, season points.)
+#   - Turn clock = time left to the deadline ÷ picks still to be made (floor
+#     MIN_TURN_SECONDS). Everyone starts equal; the clock grows as people pick fast.
+#   - Time out => the member drops one spot (swaps with the next pick in line).
+#     Timing out in the very last spot => that pick is auto-picked. At the hard
+#     deadline every empty slot is auto-picked.
+#   - Auto-pick = highest-rated player in the registered field not yet taken.
+#     Members can opt in per draft (/draft_prefs/{member}.autopick).
+#   - Pool = the live registered PDGA field (with current ratings), refreshed
+#     every FIELD_REFRESH_DRAFT seconds while a draft is open. A picked player
+#     who leaves the field is flagged (w1/w2) and, once the deadline has passed
+#     or the member is on auto-pick, replaced with the best available.
+#
+# Firebase:
+#   /field                 registered field for the draft event (app pool)
+#   /draft/{t}             the draft record (order, seq, clock, log)
+#   /draft_prefs/{member}  {autopick: bool}
+#   /notifications/{id}    same feed the app uses (on-the-clock, skipped, ...)
+#   /league/keys/picks~46~{t}  the picks themselves (app sync format)
+
+DRAFT_OPEN_DAYS_BEFORE = int(os.environ.get("DRAFT_OPEN_DAYS_BEFORE", "2"))
+DRAFT_DEADLINE_HOURS_BEFORE = int(os.environ.get("DRAFT_DEADLINE_HOURS_BEFORE", "12"))
+MIN_TURN_SECONDS = int(os.environ.get("MIN_TURN_SECONDS", str(15 * 60)))
+FIELD_REFRESH_DRAFT = int(os.environ.get("FIELD_REFRESH_DRAFT", "600"))
+FIELD_REFRESH_IDLE = int(os.environ.get("FIELD_REFRESH_IDLE", "3600"))
+FEAT_API = "https://www.pdga.com/api/v1/feat"
+ONE_PICK_SEED = {11}          # tournaments the app seeds as single-pick weeks
+DEFAULT_MEMBERS = [{"id": "cory", "name": "Cory"}, {"id": "will", "name": "Will"}, {"id": "kyle", "name": "Kyle"},
+                   {"id": "shanna", "name": "Shanna"}, {"id": "gabe", "name": "Gabe"}, {"id": "kadey", "name": "Kadey"}]
+
+_field_cache = {"event_id": None, "fetched": 0, "data": None}
+_name_map_cache = {"at": 0, "by_pdga": {}, "by_name": {}}
+
+def _now_ms(): return int(time.time() * 1000)
+def _iso(dt): return dt.astimezone(timezone.utc).isoformat()
+def _parse_iso(s):
+    try: return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception: return None
+def _day0(iso_date):
+    """start_date 'YYYY-MM-DD' -> that date at 00:00Z (the app's event-start instant)."""
+    return datetime.strptime(iso_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+def league_key(vk):
+    rec = get_firebase(f"league/keys/{_enc(vk)}")
+    try:
+        return json.loads(rec["v"]) if rec and rec.get("v") is not None else None
+    except Exception:
+        return None
+
+def write_league_key(vk, value):
+    now = _now_ms()
+    put_firebase(f"league/keys/{_enc(vk)}", {"r": now, "v": json.dumps(value, separators=(",", ":"))})
+    put_firebase("league/rev", now)
+
+def league_members():
+    m = league_key("k.chains_dgpt_2026_members_v1")
+    out = [x for x in (m or []) if isinstance(x, dict) and x.get("id")]
+    return out if len(out) >= 2 else DEFAULT_MEMBERS
+
+def name_maps():
+    """pdga -> app display name, and normalized name -> pdga (from mpo_players.json)."""
+    if time.time() - _name_map_cache["at"] > 6 * 3600:
+        by_pdga, by_name = {}, {}
+        try:
+            arr = json.loads(get(PLAYERS_URL))
+            for p in arr if isinstance(arr, list) else arr.get("players", []):
+                if p.get("pdga") is not None and p.get("name"):
+                    by_pdga[str(p["pdga"])] = p["name"]
+                    by_name[_norm(p["name"])] = str(p["pdga"]); by_name[_fl(p["name"])] = str(p["pdga"])
+            _name_map_cache.update(at=time.time(), by_pdga=by_pdga, by_name=by_name)
+        except Exception as e:
+            print(f"[draft] name map unavailable ({e})")
+    return _name_map_cache["by_pdga"], _name_map_cache["by_name"]
+
+# ---- scoring port (only what draft order needs; mirrors engine.js) ---------
+def score_event(picks, one_pick):
+    """-> list of {m,total,place,points} or None if the event isn't scored yet."""
+    if not picks: return None
+    live = [r for r in picks if isinstance(r, dict) and not r.get("scr")]
+    def has_real(r): return r.get("s1") is not None or (not one_pick and r.get("s2") is not None)
+    if not live or not all(has_real(r) for r in live): return None
+    vals = [s for r in live for s in ([r.get("s1")] if one_pick else [r.get("s1"), r.get("s2")]) if isinstance(s, (int, float))]
+    if not vals: return None
+    worst = max(vals)
+    def sc(s): return s if isinstance(s, (int, float)) else worst + DNF_PENALTY
+    rows = [{"m": r["m"], "total": sc(r.get("s1")) + (0 if one_pick else sc(r.get("s2")))} for r in live]
+    rows.sort(key=lambda r: r["total"])
+    n = len(picks)
+    place, prev = {}, None
+    for i, r in enumerate(rows):
+        place[r["m"]] = place[prev["m"]] if prev and prev["total"] == r["total"] else i + 1
+        prev = r
+    out = [{"m": r["m"], "total": r["total"], "place": place[r["m"]], "points": max(n - place[r["m"]] + 1, 1)} for r in rows]
+    out += [{"m": r["m"], "total": None, "place": n, "points": 1} for r in picks if isinstance(r, dict) and r.get("scr")]
+    return out
+
+def one_pick_for(t, settings):
+    v = settings.get(f"onepick_{t}")
+    return bool(v) if v is not None else (t in ONE_PICK_SEED)
+
+def draft_order_for(t, events, members, settings):
+    """Members in pick-1 order for event t (worst previous finish first)."""
+    season_pts, prev_res = {}, None
+    for e in sorted(events, key=lambda e: int(e.get("t") or 0)):
+        et = int(e.get("t") or 0)
+        if not et or et >= t: continue
+        res = score_event(league_key(f"picks.{et}"), one_pick_for(et, settings))
+        if not res: continue
+        for r in res: season_pts[r["m"]] = season_pts.get(r["m"], 0) + r["points"]
+        prev_res = res
+    ids = [m["id"] for m in members]
+    names = {m["id"]: m.get("name") or m["id"] for m in members}
+    if prev_res:
+        rows = sorted(prev_res, key=lambda r: (-r["place"], -(r["total"] if r["total"] is not None else 10**6),
+                                                season_pts.get(r["m"], 0), names.get(r["m"], r["m"])))
+        order = [r["m"] for r in rows if r["m"] in ids]
+        return order + [i for i in ids if i not in order]
+    return sorted(ids, key=lambda i: season_pts.get(i, 0))   # season opener: trailing member first
+
+# ---- field ---------------------------------------------------------------
+def fetch_field(event_id):
+    """Registered MPO field with current PDGA ratings, in the app's field.json shape."""
+    d = json.loads(get(f"{FEAT_API}/live-tournaments/{event_id}/event-division-results/MPO"))
+    by_pdga, _ = name_maps()
+    players = []
+    for x in d.get("results", []):
+        l = x.get("liveResult", {}) or {}
+        fn, ln = (l.get("firstName") or "").strip(), (l.get("lastName") or "").strip()
+        pdga = l.get("pdgaNum") or l.get("pdgaNumber")
+        if not ln or any(w in (fn + " " + ln) for w in ("Exemption", "Qualifier", "Monday", "DGPT", "Event")):
+            continue
+        rating = ((x.get("ratingHistory") or {}).get("rating"))
+        players.append({"firstName": fn, "lastName": ln, "pdgaNumber": pdga, "place": l.get("place", 0),
+                        "rating": rating, "name": by_pdga.get(str(pdga)) or f"{fn} {ln}".strip()})
+    return players
+
+def refresh_field(event, draft_open):
+    """Keep /field current for `event`; returns the player list (cached between refreshes)."""
+    eid = str(event["event_id"])
+    ttl = FIELD_REFRESH_DRAFT if draft_open else FIELD_REFRESH_IDLE
+    if _field_cache["event_id"] == eid and time.time() - _field_cache["fetched"] < ttl and _field_cache["data"]:
+        return _field_cache["data"]
+    try:
+        players = fetch_field(eid)
+    except Exception as e:
+        print(f"[field] fetch failed for {eid}: {e}")
+        return _field_cache["data"] if _field_cache["event_id"] == eid else None
+    if not players:
+        print(f"[field] {eid}: empty field from PDGA; keeping previous")
+        return _field_cache["data"] if _field_cache["event_id"] == eid else None
+    prev = _field_cache["data"] if _field_cache["event_id"] == eid else None
+    if prev and len(players) < 0.7 * len(prev):
+        print(f"[field] {eid}: field shrank {len(prev)} -> {len(players)}; ignoring this pull")
+        _field_cache["fetched"] = time.time()
+        return prev
+    _field_cache.update(event_id=eid, fetched=time.time(), data=players)
+    put_firebase("field", {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "event_tag": f"T{event.get('t')}", "event_id": int(eid) if eid.isdigit() else eid,
+        "event_name": event.get("name"), "player_count": len(players),
+        "source": "poller/pdga-live", "players": players,
+        "note": "Registered MPO field with current PDGA ratings. This is the draftable pool - nothing else is pickable.",
+    })
+    return players
+
+# ---- draft record ---------------------------------------------------------
+def draft_window(event, events):
+    start = _day0(_sd(event))
+    opens = start - timedelta(days=DRAFT_OPEN_DAYS_BEFORE)
+    deadline = start - timedelta(hours=DRAFT_DEADLINE_HOURS_BEFORE)
+    # never open while the previous event is still being played
+    prev = [e for e in events if _ed(e) and _ed(e) < _sd(event)]
+    if prev:
+        prev_end = _day0(max(_ed(e) for e in prev)) + timedelta(days=1)   # end_date is inclusive
+        if opens < prev_end: opens = prev_end
+    if deadline <= opens + timedelta(hours=6):
+        deadline = opens + timedelta(hours=6)
+    return opens, deadline
+
+def draft_events(events, now):
+    """Events whose draft window is relevant right now (opens-30min .. deadline+2h)."""
+    out = []
+    for e in events:
+        if not (_sd(e) and e.get("t") is not None): continue
+        opens, deadline = draft_window(e, events)
+        if opens - timedelta(minutes=30) <= now <= deadline + timedelta(hours=2):
+            out.append((e, opens, deadline))
+    return out
+
+def blank_rows(order):
+    return [{"slot": i + 1, "m": m, "p1": None, "s1": None, "p2": None, "s2": None, "p1At": None, "p2At": None}
+            for i, m in enumerate(order)]
+
+def new_record(t, event, opens, deadline, order, one_pick):
+    seq = [{"m": m, "pick": 1} for m in order]
+    if not one_pick:
+        seq += [{"m": m, "pick": 2} for m in reversed(order)]
+    for i, s in enumerate(seq):
+        s.update(i=i, status="pending", started_at=None, deadline_at=None, done_at=None, player=None)
+    return {"t": t, "event_id": str(event["event_id"]), "event_name": event.get("name"),
+            "opens_at": _iso(opens), "deadline_at": _iso(deadline), "status": "open", "one_pick": one_pick,
+            "order": order, "seq": seq, "cur": 0, "skips": {}, "log": [], "created_at": _iso(datetime.now(timezone.utc)),
+            "rules": {"open_days_before": DRAFT_OPEN_DAYS_BEFORE, "deadline_hours_before": DRAFT_DEADLINE_HOURS_BEFORE,
+                      "min_turn_seconds": MIN_TURN_SECONDS}}
+
+def notify(nid, audience, title, body, link="picks", ntype="draft"):
+    if get_firebase(f"notifications/{nid}") is not None:
+        return
+    put_firebase(f"notifications/{nid}", {"audience": audience, "title": title, "body": body,
+                                         "created_at": datetime.now(timezone.utc).isoformat(), "link": link, "type": ntype})
+
+def _log(rec, msg, **kw):
+    rec.setdefault("log", []).append(dict(at=datetime.now(timezone.utc).isoformat(), msg=msg, **kw))
+    rec["log"] = rec["log"][-80:]
+    print(f"[draft] T{rec.get('t')}: {msg}")
+
+def best_available(field, rows, one_pick):
+    taken = set()
+    for r in rows:
+        for p in ("p1",) if one_pick else ("p1", "p2"):
+            if r.get(p): taken.add(_fl(r[p]))
+    pool = sorted((p for p in field if p.get("name") and _fl(p["name"]) not in taken),
+                  key=lambda p: (-(p.get("rating") or 0), p["name"]))
+    return pool[0] if pool else None
+
+def picks_locked(event_id):
+    live = get_firebase("live") or {}
+    if str(live.get("event_id")) != str(event_id): return False
+    if (live.get("highest_completed_round") or 0) >= 1: return True
+    return any((p.get("thru") or 0) > 0 or p.get("status") == "I" for p in (live.get("players") or []))
+
+def draft_tick(events=None, now=None):
+    """Advance every relevant draft by one step of wall-clock. Cheap when idle."""
+    events = events or load_events()
+    now = now or datetime.now(timezone.utc)
+    active = draft_events(events, now)
+    if not active:
+        return 0
+    settings = league_settings()
+    members = league_members()
+    names = {m["id"]: m.get("name") or m["id"] for m in members}
+    touched = 0
+    put_firebase("draft_status", {"at": _iso(now), "events": [int(e["t"]) for e, _, _ in active], "referee": "poller"})
+    for event, opens, deadline in active:
+        t = int(event["t"]); eid = str(event["event_id"])
+        rec = get_firebase(f"draft/{t}")
+        if rec and rec.get("status") == "closed":
+            # still watch the field for withdrawals until the first throw
+            field = refresh_field(event, False)
+            if field and not picks_locked(eid):
+                rows = league_key(f"picks.{t}") or []
+                if rows and _handle_withdrawals(rec, rows, field, one_pick_for(t, settings), settings, names, force=True):
+                    write_league_key(f"picks.{t}", rows); put_firebase(f"draft/{t}", rec)
+            continue
+        if now < opens:
+            refresh_field(event, False)
+            continue
+        one = one_pick_for(t, settings)
+        field = refresh_field(event, True) or []
+        if not rec:
+            order = draft_order_for(t, events, members, settings)
+            rec = new_record(t, event, opens, deadline, order, one)
+            _log(rec, "draft opened; order " + " > ".join(names.get(m, m) for m in order))
+            notify(f"draft-{eid}-open", order, "Draft is open \U0001F94F",
+                   f"Picks for {event.get('name')} are open. Deadline {deadline.strftime('%a %H:%M')} UTC. "
+                   f"Order: {', '.join(names.get(m, m) for m in order)}.")
+        rows = league_key(f"picks.{t}")
+        seeded = False
+        if not rows:
+            rows = blank_rows(rec["order"]); seeded = True
+        by_m = {r.get("m"): r for r in rows if isinstance(r, dict)}
+        for m in rec["order"]:
+            if m not in by_m:
+                r = {"slot": len(rows) + 1, "m": m, "p1": None, "s1": None, "p2": None, "s2": None, "p1At": None, "p2At": None}
+                rows.append(r); by_m[m] = r
+        prefs = get_firebase("draft_prefs") or {}
+        picks_changed = _handle_withdrawals(rec, rows, field, one, settings, names, force=(now >= deadline), prefs=prefs, now=now) or seeded
+        rec_changed = picks_changed
+        seq = rec["seq"]; cur = int(rec.get("cur") or 0)
+
+        def remaining_steps(i):
+            return sum(1 for s in seq[i:] if s["status"] in ("pending", "on_clock"))
+
+        def do_autopick(step, how):
+            nonlocal picks_changed
+            row = by_m[step["m"]]; key = f"p{step['pick']}"
+            best = best_available(field, rows, one)
+            if not best:
+                _log(rec, f"no available player to auto-pick for {names.get(step['m'])}", m=step["m"]); return False
+            row[key] = best["name"]; row[key + "At"] = _now_ms()
+            step.update(status=how, player=best["name"], done_at=_iso(now))
+            picks_changed = True
+            _log(rec, f"{names.get(step['m'])} pick {step['pick']}: {best['name']} ({how}, rating {best.get('rating')})", m=step["m"])
+            notify(f"draft-{eid}-{step['m']}-p{step['pick']}-{how}", [step["m"]], "Auto-picked for you",
+                   f"{best['name']} was picked for you ({'clock ran out' if how == 'timeout' else 'auto-pick'}) for {event.get('name')}.")
+            return True
+
+        guard = 0
+        while cur < len(seq) and guard < 50:
+            guard += 1
+            step = seq[cur]; m = step["m"]; key = f"p{step['pick']}"
+            row = by_m[m]
+            if row.get(key):
+                if step["status"] in ("pending", "on_clock"):
+                    step.update(status="done", player=row[key], done_at=_iso(now)); rec_changed = True
+                    _log(rec, f"{names.get(m)} picked {row[key]} (pick {step['pick']})", m=m)
+                cur += 1; continue
+            if now >= deadline:
+                if not do_autopick(step, "deadline"): step.update(status="empty")
+                rec_changed = True; cur += 1; continue
+            if (prefs.get(m) or {}).get("autopick") and field:
+                if do_autopick(step, "auto"): rec_changed = True; cur += 1; continue
+            if step["status"] == "pending":
+                share = max(MIN_TURN_SECONDS, (deadline - now).total_seconds() / max(1, remaining_steps(cur)))
+                step.update(status="on_clock", started_at=_iso(now), deadline_at=_iso(now + timedelta(seconds=share)))
+                rec_changed = True
+                _log(rec, f"{names.get(m)} on the clock for pick {step['pick']} ({int(share // 60)} min)", m=m)
+                notify(f"draft-{eid}-{m}-p{step['pick']}-clock-{step.get('i')}-{cur}", [m], "You're on the clock \U0001F94F",
+                       f"Your pick {step['pick']} for {event.get('name')}: {int(share // 60)} minutes before you drop a spot.")
+                break
+            dl = _parse_iso(step.get("deadline_at"))
+            if dl and now >= dl:
+                rec["skips"][m] = int(rec["skips"].get(m, 0)) + 1
+                # drop one spot = swap with the next pick that belongs to SOMEONE ELSE.
+                # Nobody left behind you => you're in the last spot: your remaining
+                # picks are auto-picked (best available), per league rule.
+                j = next((k for k in range(cur + 1, len(seq)) if seq[k]["m"] != m), None)
+                if j is None:
+                    _log(rec, f"{names.get(m)} timed out in the last spot; auto-picking the rest", m=m)
+                    for k in range(cur, len(seq)):
+                        if seq[k]["m"] == m and not by_m[m].get(f"p{seq[k]['pick']}"):
+                            do_autopick(seq[k], "timeout")
+                    rec_changed = True; cur += 1; continue
+                nxt = seq[j]
+                seq[cur], seq[j] = nxt, step
+                step.update(status="pending", started_at=None, deadline_at=None)
+                nxt.update(status="pending", started_at=None, deadline_at=None)
+                rec_changed = True
+                _log(rec, f"{names.get(m)} timed out and drops a spot; {names.get(nxt['m'])} moves up", m=m)
+                notify(f"draft-{eid}-{m}-skip-{rec['skips'][m]}", [m], "You missed your pick",
+                       f"Your clock ran out for {event.get('name')}. You dropped one spot; {names.get(nxt['m'])} is up now.")
+                continue
+            break
+        # hard deadline: nothing may stay empty (covers a slot cleared after its turn)
+        if now >= deadline and field:
+            for r in rows:
+                if not isinstance(r, dict) or r.get("scr"): continue
+                for n in (1,) if one else (1, 2):
+                    if not r.get(f"p{n}"):
+                        best = best_available(field, rows, one)
+                        if not best: break
+                        r[f"p{n}"] = best["name"]; r[f"p{n}At"] = _now_ms(); picks_changed = True
+                        _log(rec, f"{names.get(r['m'])} pick {n} empty at deadline -> {best['name']}", m=r["m"])
+        for i, s in enumerate(seq): s["i"] = i
+        rec["cur"] = cur
+        if cur >= len(seq) and rec.get("status") != "closed":
+            rec["status"] = "closed"; rec["closed_at"] = _iso(now); rec_changed = True
+            _log(rec, "draft complete")
+            notify(f"draft-{eid}-complete", rec["order"], "Draft complete", f"All picks are in for {event.get('name')}.")
+        if picks_changed:
+            write_league_key(f"picks.{t}", rows)
+        if rec_changed:
+            put_firebase(f"draft/{t}", rec); touched += 1
+    return touched
+
+def _handle_withdrawals(rec, rows, field, one, settings, names, force, prefs=None, now=None):
+    """Flag or replace picks whose player is no longer in the registered field.
+    force=True (deadline passed / draft closed): replace immediately."""
+    if not field or len(field) < 20:
+        return False
+    now = now or datetime.now(timezone.utc)
+    in_field = {_fl(p["name"]) for p in field if p.get("name")}
+    _, by_name = name_maps()
+    field_pdga = {str(p.get("pdgaNumber")) for p in field}
+    changed = False
+    eid = rec.get("event_id")
+    for r in rows:
+        if not isinstance(r, dict) or r.get("scr"): continue
+        for n in (1,) if one else (1, 2):
+            p, w = f"p{n}", f"w{n}"
+            name = r.get(p)
+            if not name:
+                continue
+            pd = by_name.get(_norm(name)) or by_name.get(_fl(name))
+            present = (pd in field_pdga) if pd else (_fl(name) in in_field)
+            if present:
+                if r.get(w): r.pop(w, None); changed = True
+                continue
+            auto = bool(((prefs or {}).get(r["m"]) or {}).get("autopick"))
+            if force or auto:
+                best = best_available(field, rows, one)
+                if best:
+                    _log(rec, f"{names.get(r['m'])}: {name} is out of the field -> replaced with {best['name']}", m=r["m"])
+                    r[p] = best["name"]; r[p + "At"] = _now_ms(); r.pop(w, None); changed = True
+                    notify(f"draft-{eid}-{r['m']}-{p}-wd-{_fl(name).replace(' ', '')}", [r["m"]], "Pick replaced",
+                           f"{name} is no longer in the {rec.get('event_name')} field. You now have {best['name']}.")
+            elif not r.get(w):
+                r[w] = 1; changed = True
+                _log(rec, f"{names.get(r['m'])}: {name} is out of the field - flagged for re-pick", m=r["m"])
+                notify(f"draft-{eid}-{r['m']}-{p}-wdflag-{_fl(name).replace(' ', '')}", [r["m"]], "Your pick withdrew",
+                       f"{name} is no longer in the {rec.get('event_name')} field. Pick someone else before the deadline or you'll get the best available.")
+    return changed
 
 # ---------------------------------------------------------------------------
 
@@ -535,6 +955,12 @@ def main():
         except Exception as e:
             print(f"[backfill] {e}")
 
+        # Draft referee: clocks, skips, auto-picks, field refresh (no-op outside a draft window).
+        try:
+            draft_tick()
+        except Exception as e:
+            print(f"[draft] {e}")
+
         # Pick scoring sweep (cheap; every FINALIZE_EVERY seconds).
         if time.time() - last_finalize >= FINALIZE_EVERY:
             last_finalize = time.time()
@@ -553,5 +979,7 @@ if __name__ == "__main__":
         print(run_once())
     elif len(sys.argv) > 1 and sys.argv[1] == "finalize":
         print(f"finalized {finalize_picks()} event(s)")
+    elif len(sys.argv) > 1 and sys.argv[1] == "draft":
+        print(f"draft tick touched {draft_tick()} draft(s)")
     else:
         main()
