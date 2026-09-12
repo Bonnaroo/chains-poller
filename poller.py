@@ -468,9 +468,11 @@ def finalize_picks(events=None):
 # this process against one source of truth (Firebase) and the app just shows it.
 #
 # Rules (league decision, Will, 2026-09-12):
-#   - Window: opens start_date - DRAFT_OPEN_DAYS_BEFORE days at 00:00Z (Mon 8pm ET
-#     for a Thursday event) and the hard deadline is start_date 00:00Z minus
-#     DRAFT_DEADLINE_HOURS_BEFORE (Wed 8am ET). Both derive from the schedule, so a
+#   - Window: opens DRAFT_OPEN_HOURS_BEFORE (36) hours before the event's start
+#     instant (start_date 00:00Z = the evening before round 1) and the hard
+#     deadline is that start instant minus DRAFT_DEADLINE_HOURS_BEFORE (0): no
+#     buffer, you can pick right up to the event. Registration only settles
+#     mid-week, so no Monday drafting. Both derive from the schedule, so a
 #     Wednesday event shifts automatically. A draft never opens before the
 #     previous event has ended.
 #   - Snake order: last place in the previous scored event picks first; pick-2
@@ -494,8 +496,8 @@ def finalize_picks(events=None):
 #   /notifications/{id}    same feed the app uses (on-the-clock, skipped, ...)
 #   /league/keys/picks~46~{t}  the picks themselves (app sync format)
 
-DRAFT_OPEN_DAYS_BEFORE = int(os.environ.get("DRAFT_OPEN_DAYS_BEFORE", "2"))
-DRAFT_DEADLINE_HOURS_BEFORE = int(os.environ.get("DRAFT_DEADLINE_HOURS_BEFORE", "12"))
+DRAFT_OPEN_HOURS_BEFORE = int(os.environ.get("DRAFT_OPEN_HOURS_BEFORE", "36"))
+DRAFT_DEADLINE_HOURS_BEFORE = int(os.environ.get("DRAFT_DEADLINE_HOURS_BEFORE", "0"))
 MIN_TURN_SECONDS = int(os.environ.get("MIN_TURN_SECONDS", str(15 * 60)))
 FIELD_REFRESH_DRAFT = int(os.environ.get("FIELD_REFRESH_DRAFT", "600"))
 FIELD_REFRESH_IDLE = int(os.environ.get("FIELD_REFRESH_IDLE", "3600"))
@@ -642,7 +644,7 @@ def refresh_field(event, draft_open):
 # ---- draft record ---------------------------------------------------------
 def draft_window(event, events):
     start = _day0(_sd(event))
-    opens = start - timedelta(days=DRAFT_OPEN_DAYS_BEFORE)
+    opens = start - timedelta(hours=DRAFT_OPEN_HOURS_BEFORE)
     deadline = start - timedelta(hours=DRAFT_DEADLINE_HOURS_BEFORE)
     # never open while the previous event is still being played
     prev = [e for e in events if _ed(e) and _ed(e) < _sd(event)]
@@ -676,7 +678,7 @@ def new_record(t, event, opens, deadline, order, one_pick):
     return {"t": t, "event_id": str(event["event_id"]), "event_name": event.get("name"),
             "opens_at": _iso(opens), "deadline_at": _iso(deadline), "status": "open", "one_pick": one_pick,
             "order": order, "seq": seq, "cur": 0, "skips": {}, "log": [], "created_at": _iso(datetime.now(timezone.utc)),
-            "rules": {"open_days_before": DRAFT_OPEN_DAYS_BEFORE, "deadline_hours_before": DRAFT_DEADLINE_HOURS_BEFORE,
+            "rules": {"open_hours_before": DRAFT_OPEN_HOURS_BEFORE, "deadline_hours_before": DRAFT_DEADLINE_HOURS_BEFORE,
                       "min_turn_seconds": MIN_TURN_SECONDS}}
 
 def notify(nid, audience, title, body, link="picks", ntype="draft"):
