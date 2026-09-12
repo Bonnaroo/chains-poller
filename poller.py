@@ -711,6 +711,13 @@ def draft_tick(events=None, now=None):
     now = now or datetime.now(timezone.utc)
     active = draft_events(events, now)
     if not active:
+        # between drafts: keep /field pointed at the next event (hourly) so the app's
+        # Registered list and the pool are never stale
+        today = now.date().isoformat()
+        upcoming = sorted((e for e in events if _sd(e) and _sd(e) >= today and e.get("t") is not None), key=_sd)
+        if upcoming:
+            try: refresh_field(upcoming[0], False)
+            except Exception as e: print(f"[field] {e}")
         return 0
     settings = league_settings()
     members = league_members()
@@ -720,6 +727,8 @@ def draft_tick(events=None, now=None):
     for event, opens, deadline in active:
         t = int(event["t"]); eid = str(event["event_id"])
         rec = get_firebase(f"draft/{t}")
+        if rec and rec.get("demo"):
+            rec = None   # a UI demo record is never a real draft - start fresh
         if rec and rec.get("status") == "closed":
             # still watch the field for withdrawals until the first throw
             field = refresh_field(event, False)
