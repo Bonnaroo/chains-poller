@@ -24,6 +24,10 @@ schedule end_date + every player completed - never from a round number.
 """
 import json, os, re, time, unicodedata, urllib.request
 from datetime import datetime, timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None
 
 SEASON_URL = os.environ.get(
     "SEASON_URL",
@@ -50,6 +54,15 @@ def _auth():
 
 # Pick finalization knobs (mirror the app's autofinalize.js / engine.js).
 DRY_RUN = os.environ.get("DRY_RUN", "") == "1"          # log what would be written, write nothing
+POLLER_VERSION = "2026.10.20-v2"
+# Scoring source of truth: PDGA's FINAL results endpoint (not the live archive).
+RESULTS_API = "https://www.pdga.com/api/v1/feat/live-tournaments"
+# After an event ends, scores stay "provisional" (re-pulled every sweep so a late
+# PDGA correction lands) for this long, then the event is locked for good.
+PROVISIONAL_HOURS = int(os.environ.get("PROVISIONAL_HOURS", "48"))
+# Draft deadline = the FIRST TEE TIME of round 1 (PDGA publishes local tee times);
+# if none are published yet, start_date at this local hour.
+DRAFT_DEADLINE_LOCAL_HOUR = int(os.environ.get("DRAFT_DEADLINE_LOCAL_HOUR", "9"))
 SKIP_SLOTS = {7}                                          # T7 unresolved per data contract (app skips it too)
 DNF_PENALTY = 1                                           # missing/withdrawn pick = worst finisher + 1
 FINALIZE_EVERY = int(os.environ.get("FINALIZE_EVERY", "300"))   # seconds between pick-finalize sweeps
@@ -232,16 +245,49 @@ def fetch_round(event_id, round_num, meta):
         "player_count": len(players), "players": players,
     }
 
-def is_final(end_date, today, latest, highest_completed, players):
-    """Truly-final signal: end_date reached AND no one still on the course AND the
-    latest round is fully complete. Never trusts a round number alone."""
+def fetch_official_results(event_id):
+    """PDGA's final-results endpoint - the authoritative scores. Returns
+    (lookup, complete, rounds): lookup maps normalised names -> {to_par, place,
+    dnf, pdga}; complete is True when every non-DNF entrant has a final toPar."""
+    d = json.loads(get(f"{RESULTS_API}/{event_id}/event-division-results/MPO"))
+    out, complete = {}, True
+    for x in d.get("results") or []:
+        lr = x.get("liveResult") or {}; m = lr.get("member") or {}
+        tp = lr.get("toPar")
+        rec = {"to_par": tp, "place": lr.get("place"), "dnf": bool(lr.get("dnf")), "pdga": lr.get("pdgaNum")}
+        for nm in (f"{lr.get('firstName','')} {lr.get('lastName','')}", f"{m.get('firstName','')} {m.get('lastName','')}"):
+            if nm.strip():
+                out[_fl(nm)] = rec; out[_norm(nm)] = rec
+        if tp is None and not rec["dnf"]:
+            complete = False
+    if not out:
+        complete = False
+    return out, complete, (d.get("tournament") or {}).get("rounds")
+
+def is_final(end_date, today, latest, highest_completed, players, event_id=None, last_scheduled=None):
+    """Truly final, 2026-10-20 rules:
+      1. the UTC date is past end_date, OR it is end_date and every player in the
+         LAST SCHEDULED round is marked Completed by PDGA;
+      2. the official results endpoint reports a final score for everyone.
+    Never trusts HighestCompletedRound (PDGA reported 13 at Green Mountain and 5
+    before the Powerball Cup's last round teed off) or RoundStatus "I" (PDGA
+    leaves it on after play ends) - both caused wrong finalizations in 2026."""
     if not end_date or today < end_date:
         return False
-    if not players:
+    if last_scheduled is not None and latest is not None and int(latest) < int(last_scheduled):
         return False
-    if any(p.get("status") == "I" for p in players):
-        return False
-    return highest_completed >= latest
+    if today == end_date:
+        if not players or not all(p.get("completed") for p in players):
+            return False
+    if event_id:
+        try:
+            _, complete, _ = fetch_official_results(event_id)
+            if not complete:
+                return False
+        except Exception as e:
+            print(f"[final] official results unavailable for {event_id}: {e}")
+            return False
+    return True
 
 def write_rounds_index(event_id, event_name, rounds_list, rounds):
     put_firebase(f"rounds_index/{event_id}", {
@@ -411,17 +457,42 @@ def score_picks(picks, players, name_map, one_pick):
     return out, changed
 
 def finalize_picks(events=None):
-    """Sweep every final event; fill any missing pick scores. Returns count written."""
+    """Score every final event from PDGA's OFFICIAL results (2026-10-20 rewrite).
+
+    - Source: fetch_official_results(); the live archive is never used for points.
+    - Provisional window: for PROVISIONAL_HOURS after end_date every score is
+      re-pulled and overwritten so a late PDGA correction lands. After that the
+      event's rounds_index gets locked=True and nothing is touched again.
+    - A row with scr (scratched) is never scored. A pick field with lock1/lock2
+      set by the commissioner keeps its value (manual ruling).
+    - Missing / withdrawn / not-in-results pick = worst finisher + 1.
+    - Empty slot stays null (the app applies its own missing-pick penalty).
+    - Single-pick week (settings.onepick_{t}) scores p1 only.
+    Returns the number of events written."""
     events = events or load_events()
     idx = get_firebase("rounds_index") or {}
     settings = league_settings()
-    name_map = None
+    now = datetime.now(timezone.utc)
     written = 0
+    by_eid = {str(e.get("event_id")): e for e in events}
     for eid, meta in idx.items():
         if not (isinstance(meta, dict) and meta.get("event_final") is True):
             continue
+        if meta.get("locked"):
+            continue
         t = slot_for_event(events, eid)
         if t is None or t in SKIP_SLOTS:
+            continue
+        ev = by_eid.get(str(eid)) or {}
+        end = _ed(ev) or _sd(ev)
+        lock_after = (_day0(end) + timedelta(days=1, hours=PROVISIONAL_HOURS)) if end else None
+        # Lock FIRST: once the provisional window is over, never touch scores
+        # again (preserves commissioner rulings and special formats like the
+        # 2026 doubles week, whose picks are team strings).
+        if lock_after and now >= lock_after:
+            meta["locked"] = True; meta["locked_at"] = _iso(now)
+            put_firebase(f"rounds_index/{eid}", meta)
+            print(f"[picks] T{t} ({eid}) locked (provisional window over)")
             continue
         rec = get_firebase(f"league/keys/{_enc('picks.' + str(t))}")
         if not rec or not rec.get("v"):
@@ -432,31 +503,40 @@ def finalize_picks(events=None):
             continue
         if not isinstance(picks, list) or not picks:
             continue
+        try:
+            results, complete, _ = fetch_official_results(eid)
+        except Exception as e:
+            print(f"[picks] T{t} ({eid}): official results unavailable ({e}); skipping"); continue
+        if not complete:
+            print(f"[picks] T{t} ({eid}): official results not complete yet; skipping"); continue
+        worst = max((r["to_par"] for r in results.values() if isinstance(r.get("to_par"), (int, float))), default=None)
+        if worst is None:
+            continue
+        dnf = int(worst) + DNF_PENALTY
         one = bool(settings.get(f"onepick_{t}"))
-        needs = any(isinstance(r, dict) and not r.get("scr") and ((r.get("p1") and r.get("s1") is None) or
-                    (not one and r.get("p2") and r.get("s2") is None)) for r in picks)
-        if not needs:
-            continue
-        rl = played_rounds(meta.get("rounds_list") or [])
-        if not rl:
-            continue
-        last = get_firebase(f"rounds/{rl[-1]['key']}")
-        players = (last or {}).get("players") or []
-        if not players or any(p.get("status") == "I" for p in players):
-            print(f"[picks] T{t} ({eid}): last round not settled yet; skipping")
-            continue
-        if name_map is None:
-            name_map = load_name_map()
-        filled, changed = score_picks(picks, players, name_map, one)
-        if not changed:
-            continue
-        now = int(time.time() * 1000)
-        summary = ", ".join(f"{r.get('m')}:{r.get('s1')}/{r.get('s2')}" for r in filled if isinstance(r, dict))
-        print(f"[picks] T{t} ({eid}) scored -> {summary}")
-        put_firebase(f"league/keys/{_enc('picks.' + str(t))}",
-                     {"r": now, "v": json.dumps(filled, separators=(",", ":"))})
-        put_firebase("league/rev", now)
-        written += 1
+        def score_for(name):
+            r = results.get(_fl(name)) or results.get(_norm(name))
+            return int(r["to_par"]) if r and isinstance(r.get("to_par"), (int, float)) else dnf
+        changed = False
+        for r in picks:
+            if not isinstance(r, dict) or r.get("scr"):
+                continue
+            for n in (1,) if one else (1, 2):
+                p, sc, lk = f"p{n}", f"s{n}", f"lock{n}"
+                if not r.get(p) or r.get(lk):
+                    continue
+                val = score_for(r[p])
+                if r.get(sc) != val:
+                    r[sc] = val; changed = True
+            if one and r.get("s2") is not None:
+                r["s2"] = None; changed = True
+        if changed:
+            ms = int(time.time() * 1000)
+            summary = ", ".join(f"{r.get('m')}:{r.get('s1')}/{r.get('s2')}" for r in picks if isinstance(r, dict))
+            print(f"[picks] T{t} ({eid}) scored from official results -> {summary}")
+            put_firebase(f"league/keys/{_enc('picks.' + str(t))}", {"r": ms, "v": json.dumps(picks, separators=(",", ":"))})
+            put_firebase("league/rev", ms)
+            written += 1
     return written
 
 # ---------------------------------------------------------------------------
@@ -642,10 +722,41 @@ def refresh_field(event, draft_open):
     return players
 
 # ---- draft record ---------------------------------------------------------
+def first_tee_utc(event):
+    """Deadline instant: the earliest published round-1 tee time, in the event's
+    time zone, converted to UTC. Falls back to start_date at DRAFT_DEADLINE_LOCAL_HOUR
+    local when tee times aren't out yet. (Old rule closed picks at 00:00Z on the
+    start date - the evening BEFORE round 1 - and auto-filled people's slots.)"""
+    sd = _sd(event); eid = event.get("event_id")
+    tz = None
+    try:
+        meta = fetch_event_meta(str(eid))
+        tzname = meta.get("TimeZone") or "America/New_York"
+        tz = ZoneInfo(tzname) if ZoneInfo else None
+    except Exception:
+        meta = {}
+    local_date = datetime.strptime(sd, "%Y-%m-%d")
+    hour, minute = DRAFT_DEADLINE_LOCAL_HOUR, 0
+    try:
+        rd = json.loads(get(f"{LIVE_API}/live_results_fetch_round?TournID={eid}&Division=MPO&Round=1"))
+        pools = rd.get("data", {}); pools = pools if isinstance(pools, list) else [pools]
+        tts = sorted({sc.get("TeeTime") for pl in pools if isinstance(pl, dict) for sc in (pl.get("scores") or []) if sc.get("TeeTime")})
+        if tts:
+            hh, mm = tts[0].split(":")[:2]; hour, minute = int(hh), int(mm)
+    except Exception:
+        pass
+    local_dt = local_date.replace(hour=hour, minute=minute)
+    if tz: local_dt = local_dt.replace(tzinfo=tz)
+    else: local_dt = local_dt.replace(tzinfo=timezone.utc) + timedelta(hours=4)
+    return local_dt.astimezone(timezone.utc)
+
 def draft_window(event, events):
     start = _day0(_sd(event))
     opens = start - timedelta(hours=DRAFT_OPEN_HOURS_BEFORE)
-    deadline = start - timedelta(hours=DRAFT_DEADLINE_HOURS_BEFORE)
+    try:
+        deadline = first_tee_utc(event)
+    except Exception:
+        deadline = start - timedelta(hours=DRAFT_DEADLINE_HOURS_BEFORE)
     # never open while the previous event is still being played
     prev = [e for e in events if _ed(e) and _ed(e) < _sd(event)]
     if prev:
@@ -736,7 +847,7 @@ def draft_tick(events=None, now=None):
             field = refresh_field(event, False)
             if field and not picks_locked(eid):
                 rows = league_key(f"picks.{t}") or []
-                if rows and _handle_withdrawals(rec, rows, field, one_pick_for(t, settings), settings, names, force=True):
+                if rows and _handle_withdrawals(rec, rows, field, one_pick_for(t, settings), settings, names, force=False, prefs=get_firebase("draft_prefs") or {}):
                     write_league_key(f"picks.{t}", rows); put_firebase(f"draft/{t}", rec)
             continue
         if now < opens:
@@ -749,7 +860,7 @@ def draft_tick(events=None, now=None):
             rec = new_record(t, event, opens, deadline, order, one)
             _log(rec, "draft opened; order " + " > ".join(names.get(m, m) for m in order))
             notify(f"draft-{eid}-open", order, "Draft is open \U0001F94F",
-                   f"Picks for {event.get('name')} are open. Deadline {deadline.strftime('%a %H:%M')} UTC. "
+                   f"Picks for {event.get('name')} are open until {deadline.strftime('%a %H:%M')} UTC (first tee time). Pick any time - no turn clock. "
                    f"Order: {', '.join(names.get(m, m) for m in order)}.")
         rows = league_key(f"picks.{t}")
         seeded = False
@@ -761,13 +872,14 @@ def draft_tick(events=None, now=None):
                 r = {"slot": len(rows) + 1, "m": m, "p1": None, "s1": None, "p2": None, "s2": None, "p1At": None, "p2At": None}
                 rows.append(r); by_m[m] = r
         prefs = get_firebase("draft_prefs") or {}
-        picks_changed = _handle_withdrawals(rec, rows, field, one, settings, names, force=(now >= deadline), prefs=prefs, now=now) or seeded
+        picks_changed = _handle_withdrawals(rec, rows, field, one, settings, names, force=False, prefs=prefs, now=now) or seeded
         rec_changed = picks_changed
         seq = rec["seq"]; cur = int(rec.get("cur") or 0)
-
-        def remaining_steps(i):
-            return sum(1 for s in seq[i:] if s["status"] in ("pending", "on_clock"))
-
+        # 2026-10-20 (Will): NO turn clock, NO dropping spots, NO forced auto-pick.
+        # The draft order is shown as the suggested sequence; anyone may pick their
+        # own row any time the window is open. At the deadline only members who
+        # opted in (/draft_prefs/{m}.autopick) get the best available player; every
+        # other empty slot stays empty for the commissioner to fill.
         def do_autopick(step, how):
             nonlocal picks_changed
             row = by_m[step["m"]]; key = f"p{step['pick']}"
@@ -779,71 +891,34 @@ def draft_tick(events=None, now=None):
             picks_changed = True
             _log(rec, f"{names.get(step['m'])} pick {step['pick']}: {best['name']} ({how}, rating {best.get('rating')})", m=step["m"])
             notify(f"draft-{eid}-{step['m']}-p{step['pick']}-{how}", [step["m"]], "Auto-picked for you",
-                   f"{best['name']} was picked for you ({'clock ran out' if how == 'timeout' else 'auto-pick'}) for {event.get('name')}.")
+                   f"{best['name']} was picked for you (auto-pick) for {event.get('name')}.")
             return True
-
-        guard = 0
-        while cur < len(seq) and guard < 50:
-            guard += 1
-            step = seq[cur]; m = step["m"]; key = f"p{step['pick']}"
-            row = by_m[m]
+        for step in seq:
+            m = step["m"]; key = f"p{step['pick']}"; row = by_m[m]
             if row.get(key):
-                if step["status"] in ("pending", "on_clock"):
-                    step.update(status="done", player=row[key], done_at=_iso(now)); rec_changed = True
+                if step["status"] != "done":
+                    step.update(status="done", player=row[key], done_at=_iso(now), started_at=None, deadline_at=None); rec_changed = True
                     _log(rec, f"{names.get(m)} picked {row[key]} (pick {step['pick']})", m=m)
-                cur += 1; continue
-            if now >= deadline:
-                if not do_autopick(step, "deadline"): step.update(status="empty")
-                rec_changed = True; cur += 1; continue
-            if (prefs.get(m) or {}).get("autopick") and field:
-                if do_autopick(step, "auto"): rec_changed = True; cur += 1; continue
-            if step["status"] == "pending":
-                share = max(MIN_TURN_SECONDS, (deadline - now).total_seconds() / max(1, remaining_steps(cur)))
-                step.update(status="on_clock", started_at=_iso(now), deadline_at=_iso(now + timedelta(seconds=share)))
-                rec_changed = True
-                _log(rec, f"{names.get(m)} on the clock for pick {step['pick']} ({int(share // 60)} min)", m=m)
-                notify(f"draft-{eid}-{m}-p{step['pick']}-clock-{step.get('i')}-{cur}", [m], "You're on the clock \U0001F94F",
-                       f"Your pick {step['pick']} for {event.get('name')}: {int(share // 60)} minutes before you drop a spot.")
-                break
-            dl = _parse_iso(step.get("deadline_at"))
-            if dl and now >= dl:
-                rec["skips"][m] = int(rec["skips"].get(m, 0)) + 1
-                # drop one spot = swap with the next pick that belongs to SOMEONE ELSE.
-                # Nobody left behind you => you're in the last spot: your remaining
-                # picks are auto-picked (best available), per league rule.
-                j = next((k for k in range(cur + 1, len(seq)) if seq[k]["m"] != m), None)
-                if j is None:
-                    _log(rec, f"{names.get(m)} timed out in the last spot; auto-picking the rest", m=m)
-                    for k in range(cur, len(seq)):
-                        if seq[k]["m"] == m and not by_m[m].get(f"p{seq[k]['pick']}"):
-                            do_autopick(seq[k], "timeout")
-                    rec_changed = True; cur += 1; continue
-                nxt = seq[j]
-                seq[cur], seq[j] = nxt, step
-                step.update(status="pending", started_at=None, deadline_at=None)
-                nxt.update(status="pending", started_at=None, deadline_at=None)
-                rec_changed = True
-                _log(rec, f"{names.get(m)} timed out and drops a spot; {names.get(nxt['m'])} moves up", m=m)
-                notify(f"draft-{eid}-{m}-skip-{rec['skips'][m]}", [m], "You missed your pick",
-                       f"Your clock ran out for {event.get('name')}. You dropped one spot; {names.get(nxt['m'])} is up now.")
                 continue
-            break
-        # hard deadline: nothing may stay empty (covers a slot cleared after its turn)
-        if now >= deadline and field:
-            for r in rows:
-                if not isinstance(r, dict) or r.get("scr"): continue
-                for n in (1,) if one else (1, 2):
-                    if not r.get(f"p{n}"):
-                        best = best_available(field, rows, one)
-                        if not best: break
-                        r[f"p{n}"] = best["name"]; r[f"p{n}At"] = _now_ms(); picks_changed = True
-                        _log(rec, f"{names.get(r['m'])} pick {n} empty at deadline -> {best['name']}", m=r["m"])
+            if step["status"] != "pending":
+                step.update(status="pending", started_at=None, deadline_at=None); rec_changed = True
+            if now >= deadline and (prefs.get(m) or {}).get("autopick") and field:
+                if do_autopick(step, "auto"): rec_changed = True
+        cur = sum(1 for st in seq if st["status"] in ("done", "auto"))
+        # a two-hour heads-up before the deadline, once
+        if deadline - timedelta(hours=2) <= now < deadline and not rec.get("reminded"):
+            pending = sorted({st["m"] for st in seq if st["status"] == "pending"})
+            if pending:
+                notify(f"draft-{eid}-reminder", pending, "Picks close soon",
+                       f"Picks for {event.get('name')} close at {deadline.strftime('%a %H:%M')} UTC. You still have an empty slot.")
+            rec["reminded"] = True; rec_changed = True
         for i, s in enumerate(seq): s["i"] = i
         rec["cur"] = cur
-        if cur >= len(seq) and rec.get("status") != "closed":
+        if (cur >= len(seq) or now >= deadline) and rec.get("status") != "closed":
             rec["status"] = "closed"; rec["closed_at"] = _iso(now); rec_changed = True
-            _log(rec, "draft complete")
-            notify(f"draft-{eid}-complete", rec["order"], "Draft complete", f"All picks are in for {event.get('name')}.")
+            empty = sorted({st["m"] for st in seq if st["status"] == "pending"})
+            _log(rec, "draft closed" + (f"; empty slots left for the commissioner: {', '.join(names.get(m, m) for m in empty)}" if empty else "; all picks in"))
+            notify(f"draft-{eid}-complete", rec["order"], "Picks are closed", f"Picks for {event.get('name')} are closed." + (" Some slots are still empty - the commissioner will fill them." if empty else ""))
         if picks_changed:
             write_league_key(f"picks.{t}", rows)
         if rec_changed:
@@ -908,8 +983,10 @@ def run_once():
     live["round_count"] = len(rounds_list)
     live["round_index"] = next((i + 1 for i, r in enumerate(rounds_list)
                                 if r["n"] == latest), len(rounds_list))
+    _last_sched = max((int(r["n"]) for r in rounds_list if r.get("n") is not None), default=None)
     live["event_final"] = is_final(_ed(rec), today, latest,
-                                   live["highest_completed_round"], live["players"])
+                                   live["highest_completed_round"], live["players"],
+                                   event_id=event_id, last_scheduled=_last_sched)
     put_firebase("live", live)
     try:
         put_firebase(f"rounds/{event_id}-r{latest}", live)
@@ -951,9 +1028,20 @@ def main():
             msg = run_once()
             print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {msg}")
             consecutive_errors = 0
+            try:
+                put_firebase("health", {"at": _iso(datetime.now(timezone.utc)), "ok": True, "msg": msg,
+                                        "version": POLLER_VERSION, "last_finalize_at": _iso(datetime.fromtimestamp(last_finalize, timezone.utc)) if last_finalize else None,
+                                        "errors_in_a_row": 0})
+            except Exception:
+                pass
         except Exception as e:
             consecutive_errors += 1
             print(f"[error] {e} (#{consecutive_errors})")
+            try:
+                put_firebase("health", {"at": _iso(datetime.now(timezone.utc)), "ok": False, "last_error": str(e)[:300],
+                                        "version": POLLER_VERSION, "errors_in_a_row": consecutive_errors})
+            except Exception:
+                pass
             if consecutive_errors > 5:
                 time.sleep(60)
             time.sleep(POLL_SECONDS)
