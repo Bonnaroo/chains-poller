@@ -22,6 +22,7 @@ So round numbers are unreliable for "is it over." We publish a clean
 rounds_list (real rounds + human labels) and decide an event is FINAL from the
 schedule end_date + every player completed - never from a round number.
 """
+import os
 import json, os, re, time, unicodedata, urllib.request
 from datetime import datetime, timezone, timedelta
 try:
@@ -1024,6 +1025,13 @@ def main():
     last_finalize = 0
     while True:
         try:
+            # v2.1: password-reset worker rides the same loop (no-op until FIREBASE_SERVICE_ACCOUNT_JSON + SMTP_* are set)
+            if os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON"):
+                try:
+                    import reset_worker
+                    reset_worker.run_once()
+                except Exception as _rx:
+                    print("reset worker:", _rx)
             today = datetime.now(timezone.utc).date().isoformat()
             msg = run_once()
             print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {msg}")
